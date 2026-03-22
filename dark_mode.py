@@ -41,6 +41,11 @@ try:
     user32 = ctypes.windll.user32
     magapi = ctypes.windll.Magnification
     kernel32 = ctypes.windll.kernel32
+    try:
+        shcore = ctypes.windll.shcore
+        shcore.SetProcessDpiAwareness(2) # PROCESS_PER_MONITOR_DPI_AWARE
+    except AttributeError:
+        user32.SetProcessDPIAware()
 except AttributeError:
     print("Error: This script must be run on Windows.", file=sys.stderr)
     sys.exit(1)
@@ -110,13 +115,18 @@ user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
 user32.GetWindow.restype = HWND
 user32.GetWindow.argtypes = [HWND, UINT]
 
+kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+
 PM_REMOVE = 0x0001
-HWND_TOP = ctypes.cast(0, HWND)
+HWND_TOP = HWND(0)
+HWND_TOPMOST = HWND(-1)
 SWP_NOACTIVATE = 0x0010
 SWP_NOMOVE = 0x0002
 SWP_NOSIZE = 0x0001
 SWP_SHOWWINDOW = 0x0040
 SWP_HIDEWINDOW = 0x0080
+SWP_NOZORDER = 0x0004
 GW_HWNDPREV = 3
 
 INVERT_MATRIX = (ctypes.c_float * 25)(
@@ -179,10 +189,21 @@ class MagnifierOverlay:
         ctypes.memmove(ctypes.byref(effect.transform), INVERT_MATRIX, ctypes.sizeof(INVERT_MATRIX))
         magapi.MagSetColorEffect(self.magnifier_hwnd, ctypes.byref(effect))
 
-        # Include only the target window
-        hwnd_array_type = HWND * 1
-        hwnd_array = hwnd_array_type(self.target_hwnd)
-        magapi.MagSetWindowFilterList(self.magnifier_hwnd, MW_FILTERMODE_INCLUDE, 1, ctypes.cast(hwnd_array, ctypes.POINTER(HWND)))
+    def update_filters(self, excluded_hwnds):
+        """
+        Using MW_FILTERMODE_INCLUDE on complex windows (like Chromium browsers)
+        often fails to capture child process sub-windows or hardware accelerated surfaces.
+        Instead, we capture EVERYTHING under our host window, but we explicitly EXCLUDE
+        all of our own host windows so we don't magnify the magnifier (infinite loop).
+        """
+        if not self.magnifier_hwnd:
+            return
+
+        count = len(excluded_hwnds)
+        if count > 0:
+            hwnd_array_type = HWND * count
+            hwnd_array = hwnd_array_type(*excluded_hwnds)
+            magapi.MagSetWindowFilterList(self.magnifier_hwnd, MW_FILTERMODE_EXCLUDE, count, ctypes.cast(hwnd_array, ctypes.POINTER(HWND)))
 
     def update_position(self):
         if not self.host_hwnd or not self.magnifier_hwnd:
@@ -196,18 +217,28 @@ class MagnifierOverlay:
             w = rect.right - rect.left
             h = rect.bottom - rect.top
 
-            # Position host over target window in the Z-order
-            # Get the window just above our target window
+            # If minimized, hide the overlay
+            if w <= 0 or h <= 0:
+                user32.SetWindowPos(self.host_hwnd, 0, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_HIDEWINDOW | SWP_NOZORDER)
+                return True
+
+            # Move host window EXACTLY to target window size and position
+            # Keep it directly above the target window
             hwnd_insert_after = user32.GetWindow(self.target_hwnd, GW_HWNDPREV)
-            if not hwnd_insert_after:
+
+            flags = SWP_SHOWWINDOW | SWP_NOACTIVATE
+            if hwnd_insert_after == self.host_hwnd:
+                # We are already directly above it, no need to change Z-order
+                flags |= SWP_NOZORDER
+            elif hwnd_insert_after == 0:
                 hwnd_insert_after = HWND_TOP
 
-            user32.SetWindowPos(self.host_hwnd, hwnd_insert_after, rect.left, rect.top, w, h, SWP_SHOWWINDOW | SWP_NOACTIVATE)
+            user32.SetWindowPos(self.host_hwnd, hwnd_insert_after, rect.left, rect.top, w, h, flags)
 
-            # Resize magnifier
+            # Keep magnifier resized to host window client area
             user32.SetWindowPos(self.magnifier_hwnd, HWND_TOP, 0, 0, w, h, SWP_NOACTIVATE)
 
-            # Update source
+            # The source rect is the unscaled screen area of the target window
             magapi.MagSetWindowSource(self.magnifier_hwnd, rect)
             return True
 
@@ -241,32 +272,29 @@ class InversionApp:
         return buff.value
 
     def toggle_active_window(self):
-        # Called from keyboard's background thread
         hwnd = user32.GetForegroundWindow()
 
         if not hwnd:
             return
 
-        # Ignore our own overlays to prevent recursive inversion
-        # Note: self.overlays read access from another thread could technically race with writes,
-        # but the lock protects the handoff
+        # Ignore our own overlays
+        for overlay in self.overlays.values():
+            if hwnd == overlay.host_hwnd or hwnd == overlay.magnifier_hwnd:
+                return
 
         with self.lock:
-            # We don't check for overlays here fully because we just want to enqueue the HWND
             if hwnd in self.pending_toggles:
                 self.pending_toggles.remove(hwnd)
             else:
                 self.pending_toggles.add(hwnd)
 
     def _process_pending_toggles(self):
-        # Called from main thread
         toggles = []
         with self.lock:
             toggles = list(self.pending_toggles)
             self.pending_toggles.clear()
 
         for hwnd in toggles:
-            # Check if it's an overlay we own
             is_overlay = False
             for overlay in self.overlays.values():
                 if hwnd == overlay.host_hwnd or hwnd == overlay.magnifier_hwnd:
@@ -287,6 +315,19 @@ class InversionApp:
                 self.overlays[hwnd] = overlay
                 print(f"[+] Inverted window: {title} (HWND: {hwnd})")
 
+            self._update_all_filters()
+
+    def _update_all_filters(self):
+        """
+        Gathers all host windows and applies them as EXCLUDES to all magnifiers.
+        This allows the magnifier to capture the target window AND its children,
+        without capturing other magnifiers in an infinite hall-of-mirrors effect.
+        """
+        all_hosts = [o.host_hwnd for o in self.overlays.values() if o.host_hwnd]
+
+        for overlay in self.overlays.values():
+            overlay.update_filters(all_hosts)
+
     def _cleanup_stale_handles(self):
         invalid = []
         for hwnd, overlay in self.overlays.items():
@@ -297,6 +338,9 @@ class InversionApp:
             overlay = self.overlays.pop(hwnd)
             overlay.destroy()
             print(f"[!] Removed stale window handle: {hwnd}")
+
+        if invalid:
+            self._update_all_filters()
 
     def _update_magnifier_positions(self):
         self._cleanup_stale_handles()
@@ -324,7 +368,7 @@ class InversionApp:
                 self._pump_messages()
                 self._process_pending_toggles()
                 self._update_magnifier_positions()
-                time.sleep(0.01)  # 10ms loop ~100FPS max update rate
+                time.sleep(0.01)  # 100 FPS position tracking
         except KeyboardInterrupt:
             self.running = False
         finally:
