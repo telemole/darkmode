@@ -100,6 +100,12 @@ user32.GetWindowRect.argtypes = [HWND, ctypes.POINTER(RECT)]
 user32.IsWindow.restype = BOOL
 user32.IsWindow.argtypes = [HWND]
 
+user32.IsWindowVisible.restype = BOOL
+user32.IsWindowVisible.argtypes = [HWND]
+
+user32.IsIconic.restype = BOOL
+user32.IsIconic.argtypes = [HWND]
+
 user32.DestroyWindow.restype = BOOL
 user32.DestroyWindow.argtypes = [HWND]
 
@@ -212,12 +218,16 @@ class MagnifierOverlay:
         if not user32.IsWindow(self.target_hwnd):
             return False
 
+        if not user32.IsWindowVisible(self.target_hwnd) or user32.IsIconic(self.target_hwnd):
+            user32.SetWindowPos(self.host_hwnd, 0, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_HIDEWINDOW | SWP_NOZORDER)
+            return True
+
         rect = RECT()
         if user32.GetWindowRect(self.target_hwnd, ctypes.byref(rect)):
             w = rect.right - rect.left
             h = rect.bottom - rect.top
 
-            # If minimized, hide the overlay
+            # If minimized/zero-sized, hide the overlay
             if w <= 0 or h <= 0:
                 user32.SetWindowPos(self.host_hwnd, 0, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_HIDEWINDOW | SWP_NOZORDER)
                 return True
