@@ -42,6 +42,10 @@ try:
     magapi = ctypes.windll.Magnification
     kernel32 = ctypes.windll.kernel32
     try:
+        dwmapi = ctypes.windll.dwmapi
+    except AttributeError:
+        dwmapi = None
+    try:
         shcore = ctypes.windll.shcore
         shcore.SetProcessDpiAwareness(2) # PROCESS_PER_MONITOR_DPI_AWARE
     except AttributeError:
@@ -123,6 +127,12 @@ user32.GetWindow.argtypes = [HWND, UINT]
 
 kernel32.GetModuleHandleW.restype = wintypes.HMODULE
 kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+
+if dwmapi:
+    dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long
+    dwmapi.DwmGetWindowAttribute.argtypes = [HWND, DWORD, wintypes.LPVOID, DWORD]
+
+DWMWA_EXTENDED_FRAME_BOUNDS = 9
 
 PM_REMOVE = 0x0001
 HWND_TOP = HWND(0)
@@ -223,7 +233,18 @@ class MagnifierOverlay:
             return True
 
         rect = RECT()
-        if user32.GetWindowRect(self.target_hwnd, ctypes.byref(rect)):
+        # On Windows 10/11, GetWindowRect includes invisible drop shadow borders.
+        # Use DwmGetWindowAttribute with DWMWA_EXTENDED_FRAME_BOUNDS to get the true visual bounds.
+        success = False
+        if dwmapi:
+            hr = dwmapi.DwmGetWindowAttribute(self.target_hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, ctypes.byref(rect), ctypes.sizeof(rect))
+            if hr == 0: # S_OK
+                success = True
+
+        if not success:
+            success = user32.GetWindowRect(self.target_hwnd, ctypes.byref(rect))
+
+        if success:
             w = rect.right - rect.left
             h = rect.bottom - rect.top
 
