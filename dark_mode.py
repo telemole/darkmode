@@ -104,7 +104,7 @@ user32.PeekMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), HWND, UINT, UINT, 
 user32.TranslateMessage.restype = BOOL
 user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
 
-user32.DispatchMessageW.restype = wintypes.LRESULT
+user32.DispatchMessageW.restype = wintypes.LPARAM
 user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
 
 user32.GetWindow.restype = HWND
